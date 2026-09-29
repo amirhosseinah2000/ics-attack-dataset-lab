@@ -1,0 +1,15 @@
+scenario_id: MODBUS-NORMAL-001
+name: normal_water_treatment_baseline
+protocol: modbus_tcp
+class: normal
+fidelity_level: cyber_physical_simulation
+
+timeline:
+  warmup_seconds: 30
+  capture_seconds: 120
+  recovery_seconds: 0
+
+capture:
+  pcap: true
+  process_state: true
+  ground_truth: true

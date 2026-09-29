@@ -1,0 +1,22 @@
+protocol: modbus_tcp
+default_port: 5020
+transport: tcp
+unit_id: 1
+
+capture:
+  bpf: "tcp port 5020"
+
+label_dimensions:
+  - binary_label
+  - attack_family
+  - attack_type
+  - scenario_id
+  - run_id
+  - source_role
+  - target_role
+  - target_asset
+  - attack_start
+  - attack_end
+  - success
+  - physical_impact
+  - fidelity_level
