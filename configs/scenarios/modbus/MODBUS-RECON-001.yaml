@@ -1,0 +1,81 @@
+scenario_id: MODBUS-RECON-001
+name: unauthorized_read_reconnaissance
+protocol: modbus_tcp
+class:
+  binary_label: attack
+  attack_family: reconnaissance
+  attack_type: unauthorized_read
+fidelity_level: cyber_physical_simulation
+target:
+  asset: aloha-plc
+  unit_id: 1
+  port: 5020
+timeline:
+  warmup_seconds: 30
+  attack_seconds: 30
+  recovery_seconds: 30
+attack:
+  read_holding_registers:
+    address: 0
+    count: 10
+  read_coils:
+    address: 0
+    count: 9
+  requests_per_second: 5
+  write_operations: false
+capture:
+  pcap: true
+  process_state: true
+  ground_truth: true
+expected_impact:
+  network: reconnaissance_activity
+  process: none
+display_name_fa: شناسایی با خواندن غیرمجاز
+traffic_type: attack
+runner: modbus
+scenario_version: '1.0'
+attack_family: reconnaissance
+description_fa: اجرای خط لوله واقعی Aloha در شبکه محلی Docker
+default_parameters:
+  warmup_seconds: 30
+  attack_seconds: 30
+  recovery_seconds: 30
+  rate: 5.0
+parameter_constraints:
+  warmup_seconds:
+    type: integer
+    min: 0
+    max: 3600
+    label_fa: زمان گرم‌شدن (ثانیه)
+    randomize: false
+  attack_seconds:
+    type: integer
+    min: 1
+    max: 3600
+    label_fa: مدت شناسایی (ثانیه)
+    randomize: true
+  recovery_seconds:
+    type: integer
+    min: 0
+    max: 3600
+    label_fa: زمان بازیابی (ثانیه)
+    randomize: false
+  rate:
+    type: number
+    min: 0.1
+    max: 50
+    label_fa: نرخ چرخه در ثانیه (هر چرخه دو درخواست)
+    randomize: true
+required_services:
+- aloha-plc
+- aloha-hmi
+expected_outputs:
+- traffic.pcap
+- process_state.csv
+- ground_truth.jsonl
+- modbus_packets.csv
+- modbus_packets_labeled.csv
+- manifest.yaml
+- validation_report.json
+validation_profile: existing_recon
+enabled: true
