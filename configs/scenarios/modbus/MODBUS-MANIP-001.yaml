@@ -1,0 +1,92 @@
+scenario_id: MODBUS-MANIP-001
+display_name_fa: "دستکاری غیرمجاز فرایند - سرریز کنترل‌شده"
+name: manual_overflow_process_manipulation
+protocol: modbus_tcp
+traffic_type: attack
+attack_family: process_manipulation
+attack_type: manual_overflow
+fidelity_level: cyber_physical_simulation
+
+data_origin: local_software_digital_twin
+safety_scope: docker_internal_only
+
+# MITRE Aloha Water Treatment Modbus map (zero-based addresses)
+target:
+  service: aloha-plc
+  unit_id: 1
+  port: 5020
+  allowed_hostnames:
+    - aloha-plc
+
+process_map:
+  coils:
+    emergency_stop: 0
+    pump_switch: 1
+    pump_status: 2
+    inflow_valve: 3
+    outflow_valve: 4
+    inflow_mode: 5
+    overflow_alarm: 6
+    low_level_alarm: 7
+    operator_error_alarm: 8
+  holding_registers:
+    tank_level: 0
+    emergency_stop: 1
+    pump_switch: 2
+    pump_status: 3
+    inflow_valve: 4
+    outflow_valve: 5
+    inflow_rate: 6
+    outflow_rate: 7
+    inflow_mode: 8
+    overflow_alarm: 9
+
+# Default run timing. Smoke test should use shorter values from CLI.
+timeline:
+  warmup_seconds: 30
+  attack_seconds: 30
+  recovery_seconds: 30
+
+attack:
+  # The sequence is intentionally bounded to the local software PLC only.
+  sequence:
+    - operation: write_single_coil
+      address: 1
+      name: PumpSwitch
+      value: 1
+    - operation: write_single_coil
+      address: 5
+      name: InflowMode
+      value: 1
+    - operation: write_single_register
+      address: 6
+      name: InflowRate
+      value: 900
+    - operation: write_single_register
+      address: 7
+      name: OutflowRate
+      value: 50
+  observation_interval_seconds: 1.0
+  restore_original_state: true
+
+capture:
+  pcap: true
+  process_state: true
+  ground_truth: true
+  packet_labels: true
+  validation: true
+
+expected_impact:
+  network:
+    required_request_function_codes:
+      - 5
+      - 6
+  process:
+    manual_mode_enabled: true
+    inflow_greater_than_outflow: true
+    tank_level_should_rise: true
+    overflow_alarm_required: false
+
+references:
+  simulator: "MITRE Aloha Water Treatment"
+  source: "https://github.com/mitre/aloha-water-treatment"

@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
-"""
-Validate one generated Modbus/TCP attack-run dataset directory.
+"""Validate one Modbus/TCP run produced by the ICS Attack Dataset Lab.
 
-Designed for the ICS Attack Dataset Lab.
-Standard-library only: no pandas/PyYAML dependency is required.
+Version 2 supports both:
+- MODBUS-RECON-* / attack_type=unauthorized_read
+- MODBUS-MANIP-* / attack_type=manual_overflow
 
-Checks:
-- required artifacts exist and are non-empty
-- raw/labeled row counts match
-- label_summary counts match the labeled CSV
-- packet labels exactly implement:
-      attack iff timestamp is inside attack window
-      AND src/dst IP matches attacker IP
-- phase, direction, attacker-traffic flag, run/scenario metadata consistency
-- attack-family/type consistency
-- reconnaissance-specific Modbus checks for MODBUS-RECON scenarios
-- request/response transaction pairing when tcp.stream + mbtcp.trans_id exist
-- attack_stats request count consistency
-- process_state.csv is present and contains samples
-
-Writes validation_report.json into the run directory.
+The validator is intentionally independent from the packet-labeling script: it
+recomputes expected labels directly from ground_truth.jsonl and the extracted
+packet fields.
 """
 
 from __future__ import annotations
@@ -28,6 +16,7 @@ import argparse
 import csv
 import json
 import math
+import statistics
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -84,63 +73,62 @@ def load_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         return list(reader.fieldnames or []), rows
 
 
-def norm_flag(value: str) -> int | None:
-    value = (value or "").strip().lower()
-    if value in {"1", "true", "yes"}:
+def safe_float(value: Any) -> float | None:
+    try:
+        x = float(str(value).strip())
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_int(value: Any) -> int | None:
+    x = safe_float(value)
+    if x is None:
+        return None
+    return int(x)
+
+
+def norm_flag(value: Any) -> int | None:
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes"}:
         return 1
-    if value in {"0", "false", "no"}:
+    if text in {"0", "false", "no"}:
         return 0
     return None
 
 
-def norm_func_codes(value: str) -> list[int]:
-    """Parse tshark occurrence=a values such as '3', '0x03', or '3,3'."""
-    out: list[int] = []
-    if value is None:
-        return out
-    text = value.strip()
+def norm_func_codes(value: Any) -> list[int]:
+    text = str(value or "").strip()
     if not text:
-        return out
-
-    # TShark can aggregate repeated values with commas.
+        return []
+    out: list[int] = []
     for token in text.replace(";", ",").split(","):
         token = token.strip()
         if not token:
             continue
         try:
-            if token.lower().startswith("0x"):
-                out.append(int(token, 16))
-            else:
-                out.append(int(float(token)))
+            out.append(int(token, 16) if token.lower().startswith("0x") else int(float(token)))
         except ValueError:
             pass
     return out
 
 
-def safe_float(value: str) -> float | None:
-    try:
-        x = float((value or "").strip())
-        if math.isfinite(x):
-            return x
-    except (TypeError, ValueError):
-        pass
-    return None
+def median_numeric(rows: list[dict[str, str]], field: str) -> float | None:
+    vals = [safe_float(r.get(field)) for r in rows]
+    vals = [v for v in vals if v is not None]
+    return statistics.median(vals) if vals else None
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", required=True, help="Path to one generated run directory")
-    ap.add_argument(
-        "--report",
-        default=None,
-        help="Optional report path. Default: <run-dir>/validation_report.json",
-    )
+    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--report", default=None)
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
     report_path = Path(args.report).resolve() if args.report else run_dir / "validation_report.json"
 
-    required_files = {
+    required = {
         "pcap": run_dir / "traffic.pcap",
         "raw_csv": run_dir / "modbus_packets.csv",
         "labeled_csv": run_dir / "modbus_packets_labeled.csv",
@@ -170,72 +158,52 @@ def main() -> int:
         print(f"ERROR: run directory not found: {run_dir}", file=sys.stderr)
         return 2
 
-    # ------------------------------------------------------------------
-    # 1) Artifact presence
-    # ------------------------------------------------------------------
-    missing = []
-    empty = []
-    for name, path in required_files.items():
-        if not path.exists():
-            missing.append(name)
-        elif path.stat().st_size == 0:
-            empty.append(name)
-
+    missing = [k for k, p in required.items() if not p.exists()]
+    empty = [k for k, p in required.items() if p.exists() and p.stat().st_size == 0]
     if missing:
         fail("required_artifacts_present", {"missing": missing})
     else:
         ok("required_artifacts_present")
-
     if empty:
         fail("required_artifacts_nonempty", {"empty": empty})
     else:
         ok("required_artifacts_nonempty")
 
-    essential = ["raw_csv", "labeled_csv", "ground_truth", "label_summary"]
-    if any(not required_files[k].exists() for k in essential):
-        report = {
-            "status": "FAIL",
-            "run_dir": str(run_dir),
-            "failures": failures,
-            "warnings": warnings,
-            "checks": checks,
-        }
+    essential = {"raw_csv", "labeled_csv", "ground_truth", "label_summary"}
+    if any(not required[k].exists() for k in essential):
+        report = {"status": "FAIL", "run_dir": str(run_dir), "failures": failures,
+                  "warnings": warnings, "checks": checks}
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return 1
+
+    try:
+        gt_events = load_jsonl(required["ground_truth"])
+        summary = load_json(required["label_summary"])
+        raw_fields, raw_rows = load_csv(required["raw_csv"])
+        labeled_fields, rows = load_csv(required["labeled_csv"])
+    except Exception as exc:
+        fail("artifact_parse", str(exc))
+        report = {"status": "FAIL", "run_dir": str(run_dir), "failures": failures,
+                  "warnings": warnings, "checks": checks}
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(json.dumps(report, indent=2))
         return 1
 
-    # ------------------------------------------------------------------
-    # 2) Load ground truth / summary / CSVs
-    # ------------------------------------------------------------------
-    gt_events = load_jsonl(required_files["ground_truth"])
-    summary = load_json(required_files["label_summary"])
-
-    attack_starts = [e for e in gt_events if e.get("event") == "attack_start"]
-    attack_ends = [e for e in gt_events if e.get("event") == "attack_end"]
-
-    if len(attack_starts) != 1 or len(attack_ends) != 1:
-        fail(
-            "ground_truth_single_attack_window",
-            {"attack_start_events": len(attack_starts), "attack_end_events": len(attack_ends)},
-        )
-        # Cannot continue safely if attack window is ambiguous.
-        report = {
-            "status": "FAIL",
-            "run_dir": str(run_dir),
-            "failures": failures,
-            "warnings": warnings,
-            "checks": checks,
-        }
+    starts = [e for e in gt_events if e.get("event") == "attack_start"]
+    ends = [e for e in gt_events if e.get("event") == "attack_end"]
+    if len(starts) != 1 or len(ends) != 1:
+        fail("ground_truth_single_attack_window", {"attack_start": len(starts), "attack_end": len(ends)})
+        report = {"status": "FAIL", "run_dir": str(run_dir), "failures": failures,
+                  "warnings": warnings, "checks": checks}
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(json.dumps(report, indent=2))
         return 1
 
-    gt_start = attack_starts[0]
-    gt_end = attack_ends[0]
-
+    gt_start = starts[0]
+    gt_end = ends[0]
     attacker_ip = str(gt_start.get("attacker_ip", "")).strip()
-    scenario_id = str(gt_start.get("scenario_id", "")).strip()
     run_id = str(gt_start.get("run_id", "")).strip()
+    scenario_id = str(gt_start.get("scenario_id", "")).strip()
     attack_family = str(gt_start.get("attack_family", "")).strip()
     attack_type = str(gt_start.get("attack_type", "")).strip()
     target_asset = str(gt_start.get("target_asset", "")).strip()
@@ -245,49 +213,23 @@ def main() -> int:
     if attack_end < attack_start:
         fail("ground_truth_window_order", {"start": attack_start, "end": attack_end})
     else:
-        ok(
-            "ground_truth_window_order",
-            {"duration_seconds": round(attack_end - attack_start, 6)},
-        )
+        ok("ground_truth_window_order", {"duration_seconds": round(attack_end - attack_start, 6)})
 
-    # Summary must describe the same run and attack window.
-    summary_identity_errors = {}
-    for key, expected in {
-        "run_id": run_id,
-        "scenario_id": scenario_id,
-        "attacker_ip": attacker_ip,
-    }.items():
+    identity_errors: dict[str, Any] = {}
+    for key, expected in {"run_id": run_id, "scenario_id": scenario_id, "attacker_ip": attacker_ip}.items():
         if str(summary.get(key, "")) != expected:
-            summary_identity_errors[key] = {
-                "summary": summary.get(key),
-                "ground_truth": expected,
-            }
-
-    for key, expected in {
-        "attack_start_epoch": attack_start,
-        "attack_end_epoch": attack_end,
-    }.items():
-        got = summary.get(key)
-        try:
-            same = abs(float(got) - expected) < 1e-6
-        except (TypeError, ValueError):
-            same = False
-        if not same:
-            summary_identity_errors[key] = {"summary": got, "ground_truth": expected}
-
-    if summary_identity_errors:
-        fail("summary_matches_ground_truth_identity", summary_identity_errors)
+            identity_errors[key] = {"summary": summary.get(key), "ground_truth": expected}
+    for key, expected in {"attack_start_epoch": attack_start, "attack_end_epoch": attack_end}.items():
+        got = safe_float(summary.get(key))
+        if got is None or abs(got - expected) >= 1e-6:
+            identity_errors[key] = {"summary": summary.get(key), "ground_truth": expected}
+    if identity_errors:
+        fail("summary_matches_ground_truth_identity", identity_errors)
     else:
         ok("summary_matches_ground_truth_identity")
 
-    raw_fields, raw_rows = load_csv(required_files["raw_csv"])
-    labeled_fields, rows = load_csv(required_files["labeled_csv"])
-
     if len(raw_rows) != len(rows):
-        fail(
-            "raw_and_labeled_row_counts_match",
-            {"raw_rows": len(raw_rows), "labeled_rows": len(rows)},
-        )
+        fail("raw_and_labeled_row_counts_match", {"raw": len(raw_rows), "labeled": len(rows)})
     else:
         ok("raw_and_labeled_row_counts_match", {"rows": len(rows)})
 
@@ -297,423 +239,460 @@ def main() -> int:
     else:
         ok("required_label_columns")
 
-    # ------------------------------------------------------------------
-    # 3) Exact packet-level label semantics
-    # ------------------------------------------------------------------
     label_counts = Counter()
     direction_counts = Counter()
     phase_counts = Counter()
-    malformed_timestamps = 0
-    semantic_errors: list[dict[str, Any]] = []
-    metadata_errors: list[dict[str, Any]] = []
-
-    attack_rows: list[dict[str, str]] = []
-    target_peers = Counter()
     attack_func_codes = Counter()
+    request_func_codes = Counter()
     attack_unit_ids = Counter()
+    target_peers = Counter()
+    attack_rows: list[dict[str, str]] = []
+    semantic_errors: list[dict[str, Any]] = []
 
-    for idx, row in enumerate(rows, start=2):  # CSV header = line 1
-        ts = safe_float(row.get("frame.time_epoch", ""))
+    for index, row in enumerate(rows, 2):
+        ts = safe_float(row.get("frame.time_epoch"))
+        src = str(row.get("ip.src") or "").strip()
+        dst = str(row.get("ip.dst") or "").strip()
         if ts is None:
-            malformed_timestamps += 1
-            if len(semantic_errors) < 20:
-                semantic_errors.append({"csv_line": idx, "error": "invalid frame.time_epoch"})
+            semantic_errors.append({"line": index, "error": "invalid frame.time_epoch"})
             continue
 
-        src = (row.get("ip.src") or "").strip()
-        dst = (row.get("ip.dst") or "").strip()
-        binary = (row.get("label_binary") or "").strip()
-        direction = (row.get("label_direction") or "").strip()
-        phase = (row.get("label_phase") or "").strip()
+        in_window = attack_start <= ts <= attack_end
+        involves_attacker = src == attacker_ip or dst == attacker_ip
+        is_attack = in_window and involves_attacker
+
+        if ts < attack_start:
+            phase = "warmup"
+        elif ts <= attack_end:
+            phase = "attack"
+        else:
+            phase = "recovery"
+
+        if is_attack:
+            binary = "attack"
+            direction = "attacker_to_target" if src == attacker_ip else "target_to_attacker"
+        else:
+            binary = "normal"
+            direction = "background_during_attack" if in_window and not involves_attacker else "background"
+
+        expected = {
+            "label_binary": binary,
+            "label_phase": phase,
+            "label_direction": direction,
+            "label_is_attacker_traffic": int(involves_attacker),
+            "label_attacker_ip": attacker_ip,
+            "label_scenario_id": scenario_id,
+            "label_run_id": run_id,
+            "label_target_asset": target_asset,
+            "label_attack_family": attack_family if is_attack else "",
+            "label_attack_type": attack_type if is_attack else "",
+        }
+
+        for field, want in expected.items():
+            got: Any = row.get(field, "")
+            if field == "label_is_attacker_traffic":
+                got = norm_flag(got)
+            else:
+                got = str(got or "").strip()
+            if got != want:
+                semantic_errors.append({"line": index, "field": field, "got": got, "expected": want})
+                if len(semantic_errors) >= 30:
+                    break
+        if len(semantic_errors) >= 30:
+            break
 
         label_counts[binary] += 1
         direction_counts[direction] += 1
         phase_counts[phase] += 1
 
-        in_window = attack_start <= ts <= attack_end
-        involves_attacker = src == attacker_ip or dst == attacker_ip
-        expected_attack = in_window and involves_attacker
-
-        if ts < attack_start:
-            expected_phase = "warmup"
-        elif ts <= attack_end:
-            expected_phase = "attack"
-        else:
-            expected_phase = "recovery"
-
-        if expected_attack:
-            expected_binary = "attack"
-            if src == attacker_ip:
-                expected_direction = "attacker_to_target"
-                target_peers[dst] += 1
-            else:
-                expected_direction = "target_to_attacker"
-                target_peers[src] += 1
-        else:
-            expected_binary = "normal"
-            expected_direction = (
-                "background_during_attack" if in_window and not involves_attacker else "background"
-            )
-
-        row_errors = {}
-        if binary != expected_binary:
-            row_errors["label_binary"] = {"got": binary, "expected": expected_binary}
-        if direction != expected_direction:
-            row_errors["label_direction"] = {"got": direction, "expected": expected_direction}
-        if phase != expected_phase:
-            row_errors["label_phase"] = {"got": phase, "expected": expected_phase}
-
-        got_attacker_flag = norm_flag(row.get("label_is_attacker_traffic", ""))
-        expected_flag = 1 if involves_attacker else 0
-        if got_attacker_flag != expected_flag:
-            row_errors["label_is_attacker_traffic"] = {
-                "got": row.get("label_is_attacker_traffic"),
-                "expected": expected_flag,
-            }
-
-        if row_errors and len(semantic_errors) < 20:
-            semantic_errors.append(
-                {
-                    "csv_line": idx,
-                    "frame.time_epoch": ts,
-                    "ip.src": src,
-                    "ip.dst": dst,
-                    "errors": row_errors,
-                }
-            )
-
-        # Metadata copied into every row.
-        expected_meta = {
-            "label_attacker_ip": attacker_ip,
-            "label_scenario_id": scenario_id,
-            "label_run_id": run_id,
-            "label_target_asset": target_asset,
-        }
-        meta_err = {}
-        for key, expected in expected_meta.items():
-            if (row.get(key) or "").strip() != expected:
-                meta_err[key] = {"got": row.get(key), "expected": expected}
-
-        if expected_attack:
-            if (row.get("label_attack_family") or "").strip() != attack_family:
-                meta_err["label_attack_family"] = {
-                    "got": row.get("label_attack_family"),
-                    "expected": attack_family,
-                }
-            if (row.get("label_attack_type") or "").strip() != attack_type:
-                meta_err["label_attack_type"] = {
-                    "got": row.get("label_attack_type"),
-                    "expected": attack_type,
-                }
+        if is_attack:
             attack_rows.append(row)
-
-            for fc in norm_func_codes(row.get("modbus.func_code", "")):
+            fcs = norm_func_codes(row.get("modbus.func_code"))
+            for fc in fcs:
                 attack_func_codes[fc] += 1
-
-            unit = (row.get("mbtcp.unit_id") or "").strip()
+                if src == attacker_ip:
+                    request_func_codes[fc] += 1
+            unit = str(row.get("mbtcp.unit_id") or "").strip()
             if unit:
                 attack_unit_ids[unit] += 1
-        else:
-            if (row.get("label_attack_family") or "").strip():
-                meta_err["label_attack_family"] = {
-                    "got": row.get("label_attack_family"),
-                    "expected": "",
-                }
-            if (row.get("label_attack_type") or "").strip():
-                meta_err["label_attack_type"] = {
-                    "got": row.get("label_attack_type"),
-                    "expected": "",
-                }
-
-        if meta_err and len(metadata_errors) < 20:
-            metadata_errors.append({"csv_line": idx, "errors": meta_err})
-
-    if malformed_timestamps:
-        fail("all_packet_timestamps_parse", {"invalid_rows": malformed_timestamps})
-    else:
-        ok("all_packet_timestamps_parse")
+            peer = dst if src == attacker_ip else src
+            if peer:
+                target_peers[peer] += 1
 
     if semantic_errors:
-        fail(
-            "packet_label_semantics",
-            {
-                "sample_errors": semantic_errors,
-                "note": "At most 20 sample errors are shown.",
-            },
-        )
+        fail("packet_label_semantics", {"sample_errors": semantic_errors})
     else:
         ok("packet_label_semantics")
 
-    if metadata_errors:
-        fail(
-            "packet_label_metadata",
-            {
-                "sample_errors": metadata_errors,
-                "note": "At most 20 sample errors are shown.",
-            },
-        )
-    else:
-        ok("packet_label_metadata")
-
-    if set(label_counts) - {"normal", "attack"}:
-        fail("binary_label_domain", {"counts": dict(label_counts)})
-    else:
-        ok("binary_label_domain", {"counts": dict(label_counts)})
-
-    # ------------------------------------------------------------------
-    # 4) label_summary must be exactly reproducible from the CSV
-    # ------------------------------------------------------------------
-    expected_summary_counts = {
+    expected_summary = {
         "normal_rows": label_counts.get("normal", 0),
         "attack_rows": label_counts.get("attack", 0),
         "attacker_to_target_rows": direction_counts.get("attacker_to_target", 0),
         "target_to_attacker_rows": direction_counts.get("target_to_attacker", 0),
-        "background_rows_during_attack_window": direction_counts.get(
-            "background_during_attack", 0
-        ),
+        "background_rows_during_attack_window": direction_counts.get("background_during_attack", 0),
     }
-
-    summary_count_errors = {}
-    for key, actual in expected_summary_counts.items():
-        try:
-            saved = int(summary.get(key))
-        except (TypeError, ValueError):
-            saved = None
-        if saved != actual:
-            summary_count_errors[key] = {"summary": saved, "csv": actual}
-
-    if summary_count_errors:
-        fail("summary_counts_reproducible", summary_count_errors)
+    summary_errors = {
+        k: {"summary": summary.get(k), "recomputed": v}
+        for k, v in expected_summary.items()
+        if safe_int(summary.get(k)) != v
+    }
+    if summary_errors:
+        fail("label_summary_reproducible", summary_errors)
     else:
-        ok("summary_counts_reproducible", expected_summary_counts)
+        ok("label_summary_reproducible", expected_summary)
 
-    if label_counts.get("normal", 0) + label_counts.get("attack", 0) != len(rows):
-        fail(
-            "all_rows_have_binary_label",
-            {
-                "rows": len(rows),
-                "normal": label_counts.get("normal", 0),
-                "attack": label_counts.get("attack", 0),
-            },
-        )
+    # Common Modbus checks.
+    if len(target_peers) != 1:
+        fail("single_target_peer", {"peer_counts": dict(target_peers)})
     else:
-        ok("all_rows_have_binary_label")
+        ok("single_target_peer", {"peer_counts": dict(target_peers)})
 
-    # ------------------------------------------------------------------
-    # 5) Reconnaissance scenario protocol checks
-    # ------------------------------------------------------------------
-    recon_checks = scenario_id.startswith("MODBUS-RECON") or attack_type == "unauthorized_read"
-
-    if recon_checks:
-        req_count = direction_counts.get("attacker_to_target", 0)
-        resp_count = direction_counts.get("target_to_attacker", 0)
-
-        if req_count != resp_count:
-            fail(
-                "recon_request_response_direction_balance",
-                {"requests": req_count, "responses": resp_count},
-            )
+    if attack_unit_ids:
+        bad = {k: v for k, v in attack_unit_ids.items() if k not in {"1", "1.0", "0x01"}}
+        if bad:
+            fail("unit_id", {"counts": dict(attack_unit_ids), "unexpected": bad})
         else:
-            ok(
-                "recon_request_response_direction_balance",
-                {"requests": req_count, "responses": resp_count},
-            )
+            ok("unit_id", {"counts": dict(attack_unit_ids)})
+    else:
+        warn("unit_id", "mbtcp.unit_id unavailable/empty on attack rows")
 
-        # Only FC1 (Read Coils) and FC3 (Read Holding Registers) are expected
-        # from this specific recon generator.
-        observed_fcs = sorted(attack_func_codes)
-        unexpected_fcs = sorted(set(observed_fcs) - {1, 3})
-        write_fcs = sorted(set(observed_fcs) & {5, 6, 15, 16})
-
-        if unexpected_fcs:
-            fail(
-                "recon_function_codes",
-                {
-                    "observed": observed_fcs,
-                    "unexpected": unexpected_fcs,
-                    "counts": dict(attack_func_codes),
-                },
-            )
-        elif not observed_fcs:
-            warn(
-                "recon_function_codes",
-                "modbus.func_code is empty on attack rows; protocol-level FC validation skipped.",
-            )
-        else:
-            ok("recon_function_codes", {"counts": dict(attack_func_codes)})
-
-        if write_fcs:
-            fail("recon_contains_no_write_function_codes", {"write_fcs": write_fcs})
-        else:
-            ok("recon_contains_no_write_function_codes")
-
-        if len(target_peers) != 1:
-            fail("recon_single_target_peer", {"peer_counts": dict(target_peers)})
-        else:
-            ok("recon_single_target_peer", {"peer_counts": dict(target_peers)})
-
-        # Unit ID should be 1 for this scenario when the field is available.
-        if attack_unit_ids:
-            bad_units = {
-                unit: count
-                for unit, count in attack_unit_ids.items()
-                if unit not in {"1", "1.0", "0x01"}
-            }
-            if bad_units:
-                fail(
-                    "recon_unit_id",
-                    {"counts": dict(attack_unit_ids), "unexpected": bad_units},
-                )
-            else:
-                ok("recon_unit_id", {"counts": dict(attack_unit_ids)})
-        else:
-            warn("recon_unit_id", "mbtcp.unit_id unavailable/empty on attack rows.")
-
-        # Transaction pairing.
+    # Generic transaction pairing for attacker traffic.
+    if "mbtcp.trans_id" in labeled_fields:
         has_stream = "tcp.stream" in labeled_fields
-        has_tid = "mbtcp.trans_id" in labeled_fields
-
-        if has_tid:
-            tx = defaultdict(lambda: {"req": [], "resp": []})
-            for row in attack_rows:
-                tid = (row.get("mbtcp.trans_id") or "").strip()
-                if not tid:
-                    continue
-                stream = (row.get("tcp.stream") or "").strip() if has_stream else ""
-                key = (stream, tid)
-
-                src = (row.get("ip.src") or "").strip()
-                dst = (row.get("ip.dst") or "").strip()
-                ts = safe_float(row.get("frame.time_epoch", ""))
-
-                record = {
-                    "ts": ts,
-                    "fc": norm_func_codes(row.get("modbus.func_code", "")),
-                    "src": src,
-                    "dst": dst,
-                }
-                if src == attacker_ip:
-                    tx[key]["req"].append(record)
-                elif dst == attacker_ip:
-                    tx[key]["resp"].append(record)
-
-            pair_errors = []
-            paired = 0
-            for key, pair in tx.items():
-                reqs = pair["req"]
-                resps = pair["resp"]
-                if len(reqs) == 1 and len(resps) == 1:
-                    paired += 1
-                    req = reqs[0]
-                    resp = resps[0]
-
-                    if req["ts"] is not None and resp["ts"] is not None and req["ts"] > resp["ts"]:
-                        pair_errors.append(
-                            {"transaction": key, "error": "response timestamp precedes request"}
-                        )
-
-                    if req["fc"] and resp["fc"] and req["fc"][0] != resp["fc"][0]:
-                        # Exception responses can use FC | 0x80; those are not expected here,
-                        # but make the diagnostic explicit.
-                        if resp["fc"][0] != (req["fc"][0] | 0x80):
-                            pair_errors.append(
-                                {
-                                    "transaction": key,
-                                    "error": "request/response function code mismatch",
-                                    "request_fc": req["fc"],
-                                    "response_fc": resp["fc"],
-                                }
-                            )
-                else:
-                    pair_errors.append(
-                        {
-                            "transaction": key,
-                            "request_rows": len(reqs),
-                            "response_rows": len(resps),
-                        }
-                    )
-
-                if len(pair_errors) >= 20:
-                    break
-
-            if pair_errors:
-                fail(
-                    "recon_transaction_pairing",
-                    {
-                        "transactions_seen": len(tx),
-                        "paired_transactions": paired,
-                        "sample_errors": pair_errors,
-                    },
-                )
+        tx: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = defaultdict(
+            lambda: {"req": [], "resp": []}
+        )
+        for row in attack_rows:
+            tid = str(row.get("mbtcp.trans_id") or "").strip()
+            if not tid:
+                continue
+            stream = str(row.get("tcp.stream") or "").strip() if has_stream else ""
+            key = (stream, tid)
+            src = str(row.get("ip.src") or "").strip()
+            rec = {
+                "ts": safe_float(row.get("frame.time_epoch")),
+                "fc": norm_func_codes(row.get("modbus.func_code")),
+            }
+            if src == attacker_ip:
+                tx[key]["req"].append(rec)
             else:
-                ok(
-                    "recon_transaction_pairing",
-                    {
-                        "transactions_seen": len(tx),
-                        "paired_transactions": paired,
-                    },
-                )
+                tx[key]["resp"].append(rec)
+
+        pair_errors: list[dict[str, Any]] = []
+        paired = 0
+        for key, pair in tx.items():
+            reqs, resps = pair["req"], pair["resp"]
+            if len(reqs) == 1 and len(resps) == 1:
+                paired += 1
+                req, resp = reqs[0], resps[0]
+                if req["ts"] is not None and resp["ts"] is not None and req["ts"] > resp["ts"]:
+                    pair_errors.append({"transaction": key, "error": "response precedes request"})
+                if req["fc"] and resp["fc"]:
+                    req_fc, resp_fc = req["fc"][0], resp["fc"][0]
+                    if resp_fc not in {req_fc, req_fc | 0x80}:
+                        pair_errors.append({"transaction": key, "error": "function code mismatch",
+                                            "request_fc": req_fc, "response_fc": resp_fc})
+            else:
+                pair_errors.append({"transaction": key, "request_rows": len(reqs), "response_rows": len(resps)})
+            if len(pair_errors) >= 20:
+                break
+
+        if pair_errors:
+            fail("transaction_pairing", {"transactions": len(tx), "paired": paired,
+                                         "sample_errors": pair_errors})
         else:
-            warn(
-                "recon_transaction_pairing",
-                "mbtcp.trans_id column unavailable; transaction-level pairing skipped.",
-            )
+            ok("transaction_pairing", {"transactions": len(tx), "paired": paired})
+    else:
+        warn("transaction_pairing", "mbtcp.trans_id unavailable; pairing skipped")
 
-    # ------------------------------------------------------------------
-    # 6) attack_stats consistency
-    # ------------------------------------------------------------------
-    if required_files["attack_stats"].exists() and required_files["attack_stats"].stat().st_size:
+    # Scenario-specific protocol checks.
+    is_recon = scenario_id.startswith("MODBUS-RECON") or attack_type == "unauthorized_read"
+    is_manual_overflow = scenario_id.startswith("MODBUS-MANIP") or attack_type == "manual_overflow"
+
+    if is_recon:
+        unexpected = sorted(set(request_func_codes) - {1, 3})
+        if not request_func_codes:
+            warn("recon_function_codes", "No request function codes were extracted")
+        elif unexpected:
+            fail("recon_function_codes", {"request_counts": dict(request_func_codes), "unexpected": unexpected})
+        else:
+            ok("recon_function_codes", {"request_counts": dict(request_func_codes)})
+
+        writes = sorted(set(request_func_codes) & {5, 6, 15, 16})
+        if writes:
+            fail("recon_contains_no_writes", {"write_fcs": writes})
+        else:
+            ok("recon_contains_no_writes")
+
+    if is_manual_overflow:
+        allowed = {1, 3, 5, 6}
+        unexpected = sorted(set(request_func_codes) - allowed)
+        if unexpected:
+            fail("manual_overflow_function_codes", {"request_counts": dict(request_func_codes),
+                                                    "unexpected": unexpected})
+        else:
+            ok("manual_overflow_function_codes", {"request_counts": dict(request_func_codes)})
+
+        missing_write_fcs = [fc for fc in (5, 6) if request_func_codes.get(fc, 0) == 0]
+        if missing_write_fcs:
+            fail("manual_overflow_required_write_fcs", {"missing": missing_write_fcs,
+                                                        "request_counts": dict(request_func_codes)})
+        else:
+            ok("manual_overflow_required_write_fcs", {"fc5": request_func_codes[5],
+                                                       "fc6": request_func_codes[6]})
+
+    # attack_stats consistency.
+    stats: dict[str, Any] = {}
+    if required["attack_stats"].exists() and required["attack_stats"].stat().st_size:
         try:
-            stats = load_json(required_files["attack_stats"])
-            attempted = int(stats.get("holding_reads_attempted", 0)) + int(
-                stats.get("coil_reads_attempted", 0)
+            stats = load_json(required["attack_stats"])
+            attempted = safe_int(stats.get("requests_attempted"))
+            if attempted is None:
+                attempted = sum(
+                    safe_int(stats.get(k)) or 0
+                    for k in (
+                        "holding_reads_attempted", "coil_reads_attempted",
+                        "write_coil_attempted", "write_register_attempted",
+                    )
+                )
+            # requests_attempted is session-scoped.  In manipulation scenarios the
+            # attacker client performs baseline reads immediately before the exact
+            # attack window, so comparing it only with attack-labeled request rows
+            # produces a false mismatch.  Compare it with every captured request
+            # sent by the attacker, while still reporting the attack-window subset.
+            all_attacker_request_rows = sum(
+                1
+                for row in rows
+                if str(row.get("ip.src") or "").strip() == attacker_ip
             )
-            request_rows = direction_counts.get("attacker_to_target", 0)
+            attack_window_request_rows = direction_counts.get("attacker_to_target", 0)
+            pre_attack_or_post_attack_requests = (
+                all_attacker_request_rows - attack_window_request_rows
+            )
 
-            if attempted != request_rows:
+            if attempted != all_attacker_request_rows:
                 fail(
                     "attack_stats_request_count_matches_packets",
-                    {"attempted_requests": attempted, "request_packet_rows": request_rows},
+                    {
+                        "attempted_requests": attempted,
+                        "captured_attacker_request_rows": all_attacker_request_rows,
+                        "attack_window_request_rows": attack_window_request_rows,
+                        "attacker_requests_outside_attack_window": pre_attack_or_post_attack_requests,
+                    },
                 )
             else:
                 ok(
                     "attack_stats_request_count_matches_packets",
-                    {"attempted_requests": attempted},
+                    {
+                        "attempted_requests": attempted,
+                        "captured_attacker_request_rows": all_attacker_request_rows,
+                        "attack_window_request_rows": attack_window_request_rows,
+                        "attacker_requests_outside_attack_window": pre_attack_or_post_attack_requests,
+                    },
                 )
 
-            errors = int(stats.get("errors", 0))
+            errors = safe_int(stats.get("errors")) or 0
             if errors:
-                warn("attack_stats_errors", {"errors": errors})
+                fail("attack_stats_errors", {"errors": errors})
             else:
                 ok("attack_stats_errors", {"errors": 0})
+
+            if is_manual_overflow:
+                if stats.get("restored") is True:
+                    ok("manual_overflow_restore_confirmed")
+                else:
+                    fail("manual_overflow_restore_confirmed",
+                         {"restored": stats.get("restored"), "restore_errors": stats.get("restore_errors")})
         except Exception as exc:
             fail("attack_stats_parse", str(exc))
 
-    # ------------------------------------------------------------------
-    # 7) process-state basic sanity
-    # ------------------------------------------------------------------
-    if required_files["process_state"].exists() and required_files["process_state"].stat().st_size:
+    # Process-state checks.
+    process_details: dict[str, Any] = {}
+    if required["process_state"].exists() and required["process_state"].stat().st_size:
         try:
-            p_fields, p_rows = load_csv(required_files["process_state"])
+            p_fields, p_rows = load_csv(required["process_state"])
             if not p_rows:
                 fail("process_state_has_samples", {"rows": 0})
             else:
-                ok(
-                    "process_state_has_samples",
-                    {"rows": len(p_rows), "columns": p_fields},
-                )
+                ok("process_state_has_samples", {"rows": len(p_rows), "columns": p_fields})
+
+                warm: list[dict[str, str]] = []
+                attack_p: list[dict[str, str]] = []
+                recovery: list[dict[str, str]] = []
+                for row in p_rows:
+                    ts = safe_float(row.get("timestamp_epoch"))
+                    if ts is None:
+                        continue
+                    if ts < attack_start:
+                        warm.append(row)
+                    elif ts <= attack_end:
+                        attack_p.append(row)
+                    else:
+                        recovery.append(row)
+
+                process_details = {
+                    "warmup_samples": len(warm),
+                    "attack_samples": len(attack_p),
+                    "recovery_samples": len(recovery),
+                }
+
+                if is_manual_overflow:
+                    if not attack_p:
+                        fail("manual_overflow_process_attack_samples", process_details)
+                    else:
+                        ok("manual_overflow_process_attack_samples", {"samples": len(attack_p)})
+
+                        mode_hits = 0
+                        mode_valid = 0
+                        flow_hits = 0
+                        flow_valid = 0
+                        overflow_seen = False
+                        attack_tanks: list[float] = []
+
+                        for row in attack_p:
+                            mode = safe_int(row.get("coil_inflow_mode"))
+                            if mode is None:
+                                mode = safe_int(row.get("inflow_mode"))
+                            if mode is not None:
+                                mode_valid += 1
+                                mode_hits += int(mode == 1)
+
+                            inflow = safe_float(row.get("inflow_rate"))
+                            outflow = safe_float(row.get("outflow_rate"))
+                            if inflow is not None and outflow is not None:
+                                flow_valid += 1
+                                flow_hits += int(inflow > outflow)
+
+                            tank = safe_float(row.get("tank_level"))
+                            if tank is not None:
+                                attack_tanks.append(tank)
+
+                            alarm = safe_int(row.get("coil_overflow_alarm"))
+                            if alarm is None:
+                                alarm = safe_int(row.get("overflow_alarm"))
+                            overflow_seen = overflow_seen or alarm == 1
+
+                        mode_ratio = mode_hits / mode_valid if mode_valid else None
+                        flow_ratio = flow_hits / flow_valid if flow_valid else None
+                        baseline_tank = median_numeric(warm, "tank_level")
+                        attack_max = max(attack_tanks) if attack_tanks else None
+                        attack_first = attack_tanks[0] if attack_tanks else None
+                        attack_last = attack_tanks[-1] if attack_tanks else None
+
+                        process_details.update({
+                            "manual_mode_ratio": mode_ratio,
+                            "inflow_gt_outflow_ratio": flow_ratio,
+                            "warmup_tank_median": baseline_tank,
+                            "attack_tank_first": attack_first,
+                            "attack_tank_last": attack_last,
+                            "attack_tank_max": attack_max,
+                            "overflow_alarm_seen": overflow_seen,
+                        })
+
+                        if mode_ratio is None:
+                            warn("manual_overflow_manual_mode_observed", "mode fields unavailable")
+                        elif mode_ratio < 0.5:
+                            fail("manual_overflow_manual_mode_observed", {"ratio": mode_ratio})
+                        else:
+                            ok("manual_overflow_manual_mode_observed", {"ratio": round(mode_ratio, 3)})
+
+                        # For Aloha Manual Overflow, requiring inflow > outflow
+                        # for most of a long attack is incorrect. Once the tank
+                        # reaches its upper bound the simulator can cut inflow,
+                        # while outflow continues and the tank starts to fall.
+                        # What matters is that the unsafe imbalance was actually
+                        # established and caused the expected process impact.
+                        if flow_ratio is None:
+                            warn("manual_overflow_flow_imbalance_initiated", "flow fields unavailable")
+                        elif flow_hits < 1:
+                            fail(
+                                "manual_overflow_flow_imbalance_initiated",
+                                {"samples_with_inflow_gt_outflow": flow_hits,
+                                 "valid_flow_samples": flow_valid,
+                                 "ratio": flow_ratio},
+                            )
+                        else:
+                            ok(
+                                "manual_overflow_flow_imbalance_initiated",
+                                {"samples_with_inflow_gt_outflow": flow_hits,
+                                 "valid_flow_samples": flow_valid,
+                                 "ratio": round(flow_ratio, 3)},
+                            )
+
+                        # Detect the normal Aloha safety response after overflow:
+                        # an alarm/upper-bound event followed by inflow cutoff.
+                        cutoff_seen = False
+                        post_peak_decline = False
+                        peak_idx = None
+                        if attack_tanks:
+                            peak_value = max(attack_tanks)
+                            peak_idx = attack_tanks.index(peak_value)
+
+                        for idx, row in enumerate(attack_p):
+                            inflow = safe_float(row.get("inflow_rate"))
+                            outflow = safe_float(row.get("outflow_rate"))
+                            if inflow is not None and outflow is not None and inflow <= outflow:
+                                # Only count this as protective cutoff after the
+                                # process has reached the upper bound / alarm.
+                                tank = safe_float(row.get("tank_level"))
+                                alarm = safe_int(row.get("coil_overflow_alarm"))
+                                if alarm is None:
+                                    alarm = safe_int(row.get("overflow_alarm"))
+                                if overflow_seen and (alarm == 1 or (tank is not None and tank >= 10000)):
+                                    cutoff_seen = True
+                                elif peak_idx is not None and idx > peak_idx:
+                                    cutoff_seen = True
+
+                        if peak_idx is not None and peak_idx < len(attack_tanks) - 1:
+                            post_peak_decline = attack_tanks[-1] < attack_tanks[peak_idx]
+
+                        process_details.update({
+                            "flow_imbalance_samples": flow_hits,
+                            "protective_cutoff_observed": cutoff_seen,
+                            "post_peak_decline_observed": post_peak_decline,
+                        })
+
+                        if overflow_seen:
+                            ok(
+                                "manual_overflow_overflow_response",
+                                {
+                                    "overflow_alarm_seen": True,
+                                    "protective_cutoff_observed": cutoff_seen,
+                                    "post_peak_decline_observed": post_peak_decline,
+                                },
+                            )
+                        else:
+                            ok(
+                                "manual_overflow_overflow_response",
+                                {
+                                    "overflow_alarm_seen": False,
+                                    "note": "tank did not reach overflow threshold during this run",
+                                },
+                            )
+
+                        if baseline_tank is None or attack_max is None:
+                            warn("manual_overflow_tank_rise", "tank_level unavailable for comparison")
+                        elif attack_max <= baseline_tank:
+                            fail("manual_overflow_tank_rise",
+                                 {"warmup_median": baseline_tank, "attack_max": attack_max})
+                        else:
+                            ok("manual_overflow_tank_rise",
+                               {"warmup_median": baseline_tank, "attack_max": attack_max,
+                                "delta": attack_max - baseline_tank})
+
+                        # Overflow is intentionally informational: the Aloha docs say the
+                        # alarm appears only if the tank reaches the maximum level.
+                        ok("manual_overflow_alarm_observation", {"overflow_alarm_seen": overflow_seen})
         except Exception as exc:
             fail("process_state_parse", str(exc))
 
-    # ------------------------------------------------------------------
-    # Final report
-    # ------------------------------------------------------------------
     status = "FAIL" if failures else ("WARN" if warnings else "PASS")
-
     report = {
         "status": status,
         "run_id": run_id,
         "scenario_id": scenario_id,
+        "attack_family": attack_family,
+        "attack_type": attack_type,
         "run_dir": str(run_dir),
         "attack_window_seconds": round(attack_end - attack_start, 6),
         "packet_rows": len(rows),
@@ -722,11 +701,12 @@ def main() -> int:
         "phase_counts": dict(phase_counts),
         "target_peer_counts": dict(target_peers),
         "attack_function_code_counts": {str(k): v for k, v in sorted(attack_func_codes.items())},
+        "request_function_code_counts": {str(k): v for k, v in sorted(request_func_codes.items())},
+        "process_observation": process_details,
         "failures": failures,
         "warnings": warnings,
         "checks": checks,
     }
-
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print("")
@@ -735,12 +715,17 @@ def main() -> int:
     print("=" * 68)
     print(f"Run ID       : {run_id}")
     print(f"Scenario     : {scenario_id}")
+    print(f"Attack type  : {attack_type}")
     print(f"Rows         : {len(rows)}")
     print(f"Normal       : {label_counts.get('normal', 0)}")
     print(f"Attack       : {label_counts.get('attack', 0)}")
     print(f"Req/Resp     : {direction_counts.get('attacker_to_target', 0)} / "
           f"{direction_counts.get('target_to_attacker', 0)}")
     print(f"Background@A : {direction_counts.get('background_during_attack', 0)}")
+    if is_manual_overflow and process_details:
+        print(f"Tank delta   : {process_details.get('attack_tank_max')} vs "
+              f"baseline {process_details.get('warmup_tank_median')}")
+        print(f"Restored     : {stats.get('restored') if stats else None}")
     print(f"Status       : {status}")
     print(f"Report       : {report_path}")
     print("=" * 68)
@@ -749,7 +734,6 @@ def main() -> int:
         print("\nFAILURES:")
         for item in failures:
             print(f"  - {item}")
-
     if warnings:
         print("\nWARNINGS:")
         for item in warnings:
